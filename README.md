@@ -3,10 +3,6 @@
 ## Installation
 
 ```bash
-pip install -r requirements.txt
-```
-
-```bash
 git clone https://github.com/wanchichen/arkive.git
 cd arkive
 pip install -e .
@@ -35,6 +31,8 @@ If these files already exist, `test = Arkive('test_ark')` will perform a read.
 ### Adding files to archive
 ```python
 test.append(['audio.wav', 'audio.flac'])
+test.append(['audio.wav', 'audio.flac'], target_format="wav") # defaults to flac
+test.append(['audio.wav', 'audio.flac'], bit_depth=32) # defaults to 16-bit PCM
 ```
 
 If `test_ark.bin` overflows (grows beyond 32GB), it will automatically create and manage additional binary dumps to prevent gigantic files.
@@ -90,6 +88,9 @@ AudioRead(file_type='flac', modality='audio', sample_rate=16000, array=array([[0
        [0.0289917 ],
        [0.02993774]]))
 ```
+
+Data stored as `.wav` files as the underlying typing support random access partial reads, allowing you to read in a specific timespan directly into memory without loading the full file. For all other data types, the full file is read and then segmented if `start_time` and/or `end_time` are used.
+
 ### Reading files from remote archive with metadata
 
 ```python
@@ -101,4 +102,10 @@ AudioRead(file_type='flac', modality='audio', sample_rate=16000, array=array([[0
        [0.02752686],
        [0.0289917 ],
        [0.02993774]]))
+```
+
+### Deleting an archive from Python
+
+```python
+test.clear(confirm=True)
 ```
