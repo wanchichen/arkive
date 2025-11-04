@@ -4,6 +4,7 @@ Audio Archive Tool
 Converts mixed audio formats to 16-bit PCM FLAC and stores in a single archive with Parquet metadata.
 """
 
+import io
 import os
 import struct
 from pathlib import Path
@@ -17,7 +18,6 @@ from tqdm import tqdm
 
 from arkive.audio_read import generic_audio_read
 from arkive.definitions import AudioRead
-from arkive.utils import _float_to_int16, _float_to_int32, _float_to_float64, normalize
 
 class Arkive:
     """Create and manage audio archives with mixed format support."""
@@ -112,7 +112,8 @@ class Arkive:
         try:
             for i, audio_file in tqdm(enumerate(audio_files)):
                 try:
-                    if target_format is not None:
+                    curr_format = audio_file.split('.')[-1]
+                    if target_format is not None and curr_format != target_format:
                         # Convert to target format
                         file_data, sample_rate, channels, duration = self._convert_to_format(
                             audio_file, target_format, bit_depth
@@ -230,39 +231,33 @@ class Arkive:
         # Calculate duration
         duration = len(audio_data) / sample_rate
         
-        audio_data = normalize(audio_data)
         # Convert to target bit depth
         if bit_depth == 16:
-            audio_converted = _float_to_int16(audio_data)
             subtype = 'PCM_16'
         elif bit_depth == 32:
-            audio_converted = _float_to_int32(audio_data)
             subtype = 'PCM_32'
         elif bit_depth == 64:
-            audio_converted = _float_to_float64(audio_data)
             subtype = 'DOUBLE'  # 64-bit float for FLAC/WAV
         
-        # Write to temporary file in target format
-        file_extension = f'.{target_format}'
-        with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as tmp_file:
-            tmp_path = tmp_file.name
+        if target_format in ['flac', 'wav']:
+            # Use soundfile for FLAC and WAV
+            # tempfile.SpooledTemporaryFile may be a better solution
+            out_buf = io.BytesIO()
+            out_buf.name = f'temp.{target_format}'
+            sf.write(out_buf, audio_data, sample_rate, 
+                    subtype=subtype, format=target_format.upper())
+            out_buf.seek(0)
+            audio_binary = out_buf.read()
+        elif target_format in ['mp3', 'opus']:
+            # Use ffmpeg for MP3 and OPUS
+            raise NotImplementedError("Not yet validated")
+            #with tempfile.NamedTemporaryFile(suffix=f'.{target_format}', delete=False) as tmp_file:
+            #    tmp_path = tmp_file.name
+            #self._write_with_ffmpeg(audio_data, sample_rate, tmp_path, target_format, bit_depth)
         
-        try:
-            if target_format in ['flac', 'wav']:
-                # Use soundfile for FLAC and WAV
-                sf.write(tmp_path, audio_converted, sample_rate, 
-                        subtype=subtype, format=target_format.upper())
-            elif target_format in ['mp3', 'opus']:
-                # Use ffmpeg for MP3 and OPUS
-                self._write_with_ffmpeg(audio_converted, sample_rate, tmp_path, target_format, bit_depth)
-            
             # Read the file as binary
-            with open(tmp_path, 'rb') as f:
-                audio_binary = f.read()
-        finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            #with open(tmp_path, 'rb') as f:
+            #    audio_binary = f.read()
         
         return audio_binary, sample_rate, channels, duration
     
