@@ -80,7 +80,7 @@ class Arkive:
         self, 
         audio_files: List[str],
         target_format: Optional[str] = 'flac', 
-        show_progress: bool = True,
+        show_progress: bool = False,
         bit_depth: int = 16
     ):
         """
@@ -115,13 +115,13 @@ class Arkive:
                     curr_format = audio_file.split('.')[-1]
                     if target_format is not None and curr_format != target_format:
                         # Convert to target format
-                        file_data, sample_rate, channels, duration = self._convert_to_format(
+                        file_data, sample_rate, channels, samples = self._convert_to_format(
                             audio_file, target_format, bit_depth
                         )
                         file_format = target_format
                     else:
                         # Retain original format
-                        file_data, sample_rate, channels, duration, file_format = self._read_original_format(audio_file)
+                        file_data, sample_rate, channels, samples, file_format = self._read_original_format(audio_file)
                     
                     file_size = len(file_data)
                     
@@ -146,11 +146,12 @@ class Arkive:
                     metadata_records.append({
                         'original_file_path': str(Path(audio_file).absolute()),
                         'bin_index': current_bin_index,
+                        'path': str(current_bin_path),
                         'start_byte_offset': current_offset,
                         'file_size_bytes': file_size,
                         'sample_rate': sample_rate,
                         'channels': channels,
-                        'duration_seconds': duration,
+                        'length': samples,
                         'format': file_format,
                         'bit_depth': bit_depth if target_format is not None else None
                     })
@@ -212,7 +213,7 @@ class Arkive:
             bit_depth: Bit depth (16, 32, or 64)
             
         Returns:
-            Tuple of (audio_data, sample_rate, channels, duration)
+            Tuple of (audio_data, sample_rate, channels, samples)
         """
         # Read audio file using soundfile (supports WAV, FLAC, OGG)
         try:
@@ -227,9 +228,6 @@ class Arkive:
             audio_data = audio_data.reshape(-1, 1)
         else:
             channels = audio_data.shape[1]
-        
-        # Calculate duration
-        duration = len(audio_data) / sample_rate
         
         # Convert to target bit depth
         if bit_depth == 16:
@@ -259,7 +257,7 @@ class Arkive:
             #with open(tmp_path, 'rb') as f:
             #    audio_binary = f.read()
         
-        return audio_binary, sample_rate, channels, duration
+        return audio_binary, sample_rate, channels, len(audio_data)
     
     def _read_original_format(self, audio_file: str) -> tuple:
         """
@@ -288,13 +286,10 @@ class Arkive:
         else:
             channels = audio_data.shape[1]
         
-        # Calculate duration
-        duration = len(audio_data) / sample_rate
-        
         # Determine format from file extension
         file_format = Path(audio_file).suffix.lower().lstrip('.')
         
-        return file_data, sample_rate, channels, duration, file_format
+        return file_data, sample_rate, channels, duration, len(audio_data)
     
     def _read_with_ffmpeg(self, audio_file: str) -> tuple:
         """

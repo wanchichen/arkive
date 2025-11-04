@@ -1,4 +1,4 @@
-
+import os
 from typing import List, Tuple
 from arkive.archive import Arkive
 from arkive.audio_read import wav_audio_read, audio_read_local, audio_read_remote
@@ -27,8 +27,8 @@ def audio_read(
     end_time: int = None
 ) -> AudioRead:
 
-    if archive_path.startswith('s3://') or is_url_regex(archive_path):
-        return audio_read_remote(
+    if os.path.exists(archive_path):
+        return audio_read_local(
             archive_path,
             start_offset,
             file_size,
@@ -37,7 +37,7 @@ def audio_read(
         )
 
     else:
-        return audio_read_local(
+        return audio_read_remote(
             archive_path,
             start_offset,
             file_size,
