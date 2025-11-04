@@ -289,7 +289,7 @@ class Arkive:
         # Determine format from file extension
         file_format = Path(audio_file).suffix.lower().lstrip('.')
         
-        return file_data, sample_rate, channels, duration, len(audio_data)
+        return file_data, sample_rate, channels, len(audio_data), file_format
     
     def _read_with_ffmpeg(self, audio_file: str) -> tuple:
         """
