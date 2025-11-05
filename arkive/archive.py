@@ -44,6 +44,8 @@ class Arkive:
             self.data = self.get_metadata()
 
     def __len__(self):
+        if self.data is None:
+            return 0
         return len(self.data)
         
     def _get_bin_file_path(self, bin_index: int) -> Path:
@@ -130,7 +132,7 @@ class Arkive:
                     if needs_conversion:
                         # Convert to target format and bit depth
                         file_data, sample_rate, channels, samples = self._convert_to_format(
-                            orig_audio_data, orig_sample_rate, target_format, target_bit_depth
+                            orig_audio_data, orig_sample_rate, orig_channels, target_format, target_bit_depth
                         )
                         file_format = target_format
                         bit_depth = target_bit_depth
@@ -201,9 +203,6 @@ class Arkive:
             # Create new metadata file
             new_df.to_parquet(self.metadata_file, index=False)
             self.data = new_df
-            
-            if show_progress:
-                print(f"\nArchive created successfully!")
         
         if show_progress:
             print(f"\nArchive created successfully!")
@@ -265,20 +264,19 @@ class Arkive:
         Convert audio file to specified format and bit depth.
         
         Args:
-            audio_file: Path to input audio file
+            audio_data: Audio data as numpy array
+            sample_rate: Sample rate in Hz
+            channels: Number of channels (will be recalculated from audio_data if inconsistent)
             target_format: Target format ('flac', 'wav', 'mp3', 'opus')
             target_bit_depth: Bit depth (16, 32, or 64)
             
         Returns:
-            Tuple of (audio_data, sample_rate, channels, samples)
+            Tuple of (file_data, sample_rate, channels, samples)
         """
         
-        # Get number of channels
-        if audio_data.ndim == 1:
-            channels = 1
+        # Get number of channels from audio data (recalculate to ensure consistency)
+        if channels == 1:
             audio_data = audio_data.reshape(-1, 1)
-        else:
-            channels = audio_data.shape[1]
         
         # Convert to target bit depth
         if target_bit_depth == 16:
@@ -464,11 +462,15 @@ class Arkive:
         
         Args:
             index: Index of the file in the metadata
-            output_path: Optional path to save the extracted file
+            start_time: Optional start time in seconds
+            end_time: Optional end time in seconds
             
         Returns:
             Binary data of the file
         """
+        if self.data is None:
+            raise ValueError("Archive has no metadata. Cannot extract files.")
+        
         df = self.data
         
         if index < 0 or index >= len(df):
@@ -534,6 +536,11 @@ class Arkive:
     
     def summary(self):
         """Print a formatted list of files in the archive."""
+        if self.data is None:
+            print(f"\nArchive: {self.archive_path}")
+            print("Archive is empty (no metadata file found).")
+            return
+        
         df = self.data
         
         print(f"\nArchive: {self.archive_path}")
@@ -558,8 +565,10 @@ class Arkive:
             filename = Path(row['original_file_path']).name
             size_mb = row['file_size_bytes'] / (1024**2)
             bin_idx = row['bin_index']
+            # Calculate duration from samples and sample_rate
+            duration_seconds = row['length'] / row['sample_rate'] if row['sample_rate'] > 0 else 0
             print(f"{idx:4d} | Bin{bin_idx} | {filename:40s} | {row['sample_rate']:6d}Hz | "
-                    f"{row['channels']:1d}ch | {row['duration_seconds']:7.2f}s | {size_mb:7.2f}MB")
+                    f"{row['channels']:1d}ch | {duration_seconds:7.2f}s | {size_mb:7.2f}MB")
 
     def clear(self, confirm: bool = False):
         """
@@ -601,7 +610,9 @@ class Arkive:
                 bin_index += 1
             else:
                 break
-        self.data = self.get_metadata()
+        
+        # Reset data attribute after clearing
+        self.data = None
         
         print(f"Archive '{self.archive_path.stem}' cleared successfully!")
         print(f"Deleted {files_deleted} file(s) ({bin_index} bin file(s) + metadata).")
