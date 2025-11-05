@@ -81,7 +81,7 @@ class Arkive:
         audio_files: List[str],
         target_format: Optional[str] = 'flac', 
         show_progress: bool = False,
-        bit_depth: int = 16
+        target_bit_depth: int = 16
     ):
         """
         Create a new archive from a list of audio files.
@@ -90,7 +90,7 @@ class Arkive:
             audio_files: List of paths to audio files (WAV, FLAC, MP3, OPUS, etc.)
             target_format: Target format for conversion ('flac', 'wav', 'mp3', 'opus', or None to retain original)
             show_progress: Whether to show progress messages
-            bit_depth: Bit depth for conversion (16, 32, or 64). Only applies when target_format is not None.
+            target_bit_depth: Target bit depth for conversion (16, 32, or 64). Only applies when target_format is not None.
         """
         metadata_records = []
         current_bin_index, current_offset = self._get_current_bin_info()
@@ -102,8 +102,8 @@ class Arkive:
             if target_format not in valid_formats:
                 raise ValueError(f"target_format must be one of {valid_formats} or None, got '{target_format}'")
         
-        if bit_depth not in [16, 32, 64]:
-            raise ValueError(f"bit_depth must be 16, 32, or 64, got {bit_depth}")
+        if target_bit_depth not in [16, 32, 64]:
+            raise ValueError(f"target_bit_depth must be 16, 32, or 64, got {target_bit_depth}")
         
         # Open the current bin file for appending
         current_bin_path = self._get_bin_file_path(current_bin_index)
@@ -112,16 +112,33 @@ class Arkive:
         try:
             for i, audio_file in tqdm(enumerate(audio_files)):
                 try:
-                    curr_format = audio_file.split('.')[-1]
-                    if target_format is not None and curr_format != target_format:
-                        # Convert to target format
+                    org_format = audio_file.split('.')[-1].lower()
+                    
+                    # First, get original file info including bit depth
+                    original_data, orig_sample_rate, orig_channels, orig_samples, orig_format, orig_bit_depth = self._read_original_format(audio_file)
+                    
+                    # Determine if conversion is needed
+                    needs_conversion = False
+                    if target_format is not None:
+                        # Check if format or bit depth differs
+                        if org_format != target_format or orig_bit_depth != target_bit_depth:
+                            needs_conversion = True
+                    
+                    if needs_conversion:
+                        # Convert to target format and bit depth
                         file_data, sample_rate, channels, samples = self._convert_to_format(
-                            audio_file, target_format, bit_depth
+                            audio_file, target_format, target_bit_depth
                         )
                         file_format = target_format
+                        bit_depth = target_bit_depth
                     else:
-                        # Retain original format
-                        file_data, sample_rate, channels, samples, file_format = self._read_original_format(audio_file)
+                        # Use original format and bit depth
+                        file_data = original_data
+                        sample_rate = orig_sample_rate
+                        channels = orig_channels
+                        samples = orig_samples
+                        file_format = orig_format
+                        bit_depth = orig_bit_depth
                     
                     file_size = len(file_data)
                     
@@ -153,7 +170,7 @@ class Arkive:
                         'channels': channels,
                         'length': samples,
                         'format': file_format,
-                        'bit_depth': bit_depth if target_format is not None else None
+                        'bit_depth': bit_depth
                     })
                     
                     current_offset += file_size
@@ -203,14 +220,44 @@ class Arkive:
                             if self._get_bin_file_path(idx).exists()))
             print(f"Total size: {total_size / (1024**3):.2f} GB")
     
-    def _convert_to_format(self, audio_file: str, target_format: str, bit_depth: int) -> tuple:
+    def _get_bit_depth_from_subtype(self, subtype: str) -> int:
+        """
+        Get bit depth from soundfile subtype string.
+        
+        Args:
+            subtype: Subtype string from soundfile (e.g., 'PCM_16', 'PCM_24', 'FLOAT', 'DOUBLE')
+            
+        Returns:
+            Bit depth as integer
+        """
+        subtype_upper = subtype.upper()
+        
+        # PCM formats
+        if 'PCM_16' in subtype_upper or 'PCM16' in subtype_upper:
+            return 16
+        elif 'PCM_24' in subtype_upper or 'PCM24' in subtype_upper:
+            return 24
+        elif 'PCM_32' in subtype_upper or 'PCM32' in subtype_upper:
+            return 32
+        elif 'PCM_8' in subtype_upper or 'PCM8' in subtype_upper:
+            return 8
+        # Float formats
+        elif 'FLOAT' in subtype_upper and 'DOUBLE' not in subtype_upper:
+            return 32  # Single precision float
+        elif 'DOUBLE' in subtype_upper:
+            return 64  # Double precision float
+        # Default
+        else:
+            return 16  # Default to 16-bit if unknown
+    
+    def _convert_to_format(self, audio_file: str, target_format: str, target_bit_depth: int) -> tuple:
         """
         Convert audio file to specified format and bit depth.
         
         Args:
             audio_file: Path to input audio file
             target_format: Target format ('flac', 'wav', 'mp3', 'opus')
-            bit_depth: Bit depth (16, 32, or 64)
+            target_bit_depth: Bit depth (16, 32, or 64)
             
         Returns:
             Tuple of (audio_data, sample_rate, channels, samples)
@@ -230,11 +277,11 @@ class Arkive:
             channels = audio_data.shape[1]
         
         # Convert to target bit depth
-        if bit_depth == 16:
+        if target_bit_depth == 16:
             subtype = 'PCM_16'
-        elif bit_depth == 32:
+        elif target_bit_depth == 32:
             subtype = 'PCM_32'
-        elif bit_depth == 64:
+        elif target_bit_depth == 64:
             subtype = 'DOUBLE'  # 64-bit float for FLAC/WAV
         
         if target_format in ['flac', 'wav']:
@@ -251,7 +298,7 @@ class Arkive:
             raise NotImplementedError("Not yet validated")
             #with tempfile.NamedTemporaryFile(suffix=f'.{target_format}', delete=False) as tmp_file:
             #    tmp_path = tmp_file.name
-            #self._write_with_ffmpeg(audio_data, sample_rate, tmp_path, target_format, bit_depth)
+            #self._write_with_ffmpeg(audio_data, sample_rate, tmp_path, target_format, target_bit_depth)
         
             # Read the file as binary
             #with open(tmp_path, 'rb') as f:
@@ -267,7 +314,7 @@ class Arkive:
             audio_file: Path to input audio file
             
         Returns:
-            Tuple of (file_data, sample_rate, channels, duration, format)
+            Tuple of (file_data, sample_rate, channels, duration, format, bit_depth)
         """
         # Read the file as binary
         with open(audio_file, 'rb') as f:
@@ -276,9 +323,13 @@ class Arkive:
         # Get audio info for metadata
         try:
             audio_data, sample_rate = sf.read(audio_file, dtype='float32')
+            # Get bit depth from file info
+            info = sf.info(audio_file)
+            bit_depth = self._get_bit_depth_from_subtype(info.subtype)
         except:
             # Fall back to ffmpeg for formats not supported by soundfile
             audio_data, sample_rate = self._read_with_ffmpeg(audio_file)
+            bit_depth = 16  # Default for ffmpeg conversion
         
         # Get number of channels
         if audio_data.ndim == 1:
@@ -289,7 +340,7 @@ class Arkive:
         # Determine format from file extension
         file_format = Path(audio_file).suffix.lower().lstrip('.')
         
-        return file_data, sample_rate, channels, len(audio_data), file_format
+        return file_data, sample_rate, channels, len(audio_data), file_format, bit_depth
     
     def _read_with_ffmpeg(self, audio_file: str) -> tuple:
         """
@@ -339,7 +390,7 @@ class Arkive:
         return audio_data, sample_rate
     
     def _write_with_ffmpeg(self, audio_data: np.ndarray, sample_rate: int, 
-                          output_path: str, target_format: str, bit_depth: int):
+                          output_path: str, target_format: str, target_bit_depth: int):
         """
         Write audio data using ffmpeg for MP3 and OPUS formats.
         
@@ -348,7 +399,7 @@ class Arkive:
             sample_rate: Sample rate in Hz
             output_path: Output file path
             target_format: Target format ('mp3' or 'opus')
-            bit_depth: Bit depth (16, 32, or 64)
+            target_bit_depth: Target bit depth (16, 32, or 64)
         """
         # First write to temporary WAV file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
@@ -356,9 +407,9 @@ class Arkive:
         
         try:
             # Write as WAV with appropriate bit depth
-            if bit_depth == 16:
+            if target_bit_depth == 16:
                 sf.write(tmp_wav_path, audio_data, sample_rate, subtype='PCM_16', format='WAV')
-            elif bit_depth == 32:
+            elif target_bit_depth == 32:
                 sf.write(tmp_wav_path, audio_data, sample_rate, subtype='PCM_32', format='WAV')
             else:  # 64
                 sf.write(tmp_wav_path, audio_data, sample_rate, subtype='DOUBLE', format='WAV')
@@ -366,7 +417,7 @@ class Arkive:
             # Convert to target format using ffmpeg
             if target_format == 'mp3':
                 # Use high quality MP3 encoding
-                bitrate = '320k' if bit_depth >= 32 else '192k'
+                bitrate = '320k' if target_bit_depth >= 32 else '192k'
                 cmd = [
                     'ffmpeg', '-i', tmp_wav_path,
                     '-codec:a', 'libmp3lame',
@@ -376,7 +427,7 @@ class Arkive:
                 ]
             elif target_format == 'opus':
                 # Use high quality OPUS encoding
-                bitrate = '256k' if bit_depth >= 32 else '128k'
+                bitrate = '256k' if target_bit_depth >= 32 else '128k'
                 cmd = [
                     'ffmpeg', '-i', tmp_wav_path,
                     '-codec:a', 'libopus',
