@@ -6,9 +6,8 @@ Converts mixed audio formats to 16-bit PCM FLAC and stores in a single archive w
 
 import io
 import os
-import struct
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Optional
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -37,7 +36,7 @@ class Arkive:
                     ...
                     metadata.parquet
         """
-        self.archive_path = Path(archive_dir) / "audio_arkive"
+        self.archive_path = Path(archive_dir) / "arkive"
         self.metadata_file = Path(archive_dir) / "metadata.parquet"
 
         self.data = None
@@ -77,13 +76,14 @@ class Arkive:
                     prev_bin_path = self._get_bin_file_path(bin_index - 1)
                     return bin_index - 1, prev_bin_path.stat().st_size
             bin_index += 1
-        
+
     def append(
         self, 
         audio_files: List[str],
         target_format: Optional[str] = 'flac', 
         show_progress: bool = False,
-        target_bit_depth: int = 16
+        target_bit_depth: int = 16,
+        flush_interval: int = 10
     ):
         """
         Create a new archive from a list of audio files.
@@ -93,6 +93,7 @@ class Arkive:
             target_format: Target format for conversion ('flac', 'wav', 'mp3', 'opus', or None to retain original)
             show_progress: Whether to show progress messages
             target_bit_depth: Target bit depth for conversion (16, 32, or 64). Only applies when target_format is not None.
+            flush_interval: Flush bin file buffer to disk every N files (default: 10). Set to 0 to disable periodic flushing.
         """
         metadata_records = []
         current_bin_index, current_offset = self._get_current_bin_info()
@@ -114,28 +115,28 @@ class Arkive:
         try:
             for i, audio_file in tqdm(enumerate(audio_files)):
                 try:
-                    org_format = audio_file.split('.')[-1].lower()
+                    orig_format = audio_file.split('.')[-1].lower()
                     
                     # First, get original file info including bit depth
-                    original_data, orig_sample_rate, orig_channels, orig_samples, orig_format, orig_bit_depth = self._read_original_format(audio_file)
+                    orig_file_data, orig_audio_data, orig_sample_rate, orig_channels, orig_samples, orig_format, orig_bit_depth = self._read_original_format(audio_file)
                     
                     # Determine if conversion is needed
                     needs_conversion = False
                     if target_format is not None:
                         # Check if format or bit depth differs
-                        if org_format != target_format or orig_bit_depth != target_bit_depth:
+                        if orig_format != target_format or orig_bit_depth != target_bit_depth:
                             needs_conversion = True
                     
                     if needs_conversion:
                         # Convert to target format and bit depth
                         file_data, sample_rate, channels, samples = self._convert_to_format(
-                            audio_file, target_format, target_bit_depth
+                            orig_audio_data, orig_sample_rate, target_format, target_bit_depth
                         )
                         file_format = target_format
                         bit_depth = target_bit_depth
                     else:
                         # Use original format and bit depth
-                        file_data = original_data
+                        file_data = orig_file_data
                         sample_rate = orig_sample_rate
                         channels = orig_channels
                         samples = orig_samples
@@ -156,7 +157,7 @@ class Arkive:
                         current_bin_file = open(current_bin_path, 'wb')
                         
                         if show_progress:
-                            print(f"  → Creating new bin file: {current_bin_path.name} (previous bin full)")
+                            print(f"Creating new bin file: {current_bin_path.name} (previous bin full)")
                     
                     # Write to current bin file
                     current_bin_file.write(file_data)
@@ -252,7 +253,14 @@ class Arkive:
         else:
             return 16  # Default to 16-bit if unknown
     
-    def _convert_to_format(self, audio_file: str, target_format: str, target_bit_depth: int) -> tuple:
+    def _convert_to_format(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int,
+        channels: int,
+        target_format: str,
+        target_bit_depth: int
+    ) -> tuple:
         """
         Convert audio file to specified format and bit depth.
         
@@ -264,12 +272,6 @@ class Arkive:
         Returns:
             Tuple of (audio_data, sample_rate, channels, samples)
         """
-        # Read audio file using soundfile (supports WAV, FLAC, OGG)
-        try:
-            audio_data, sample_rate = sf.read(audio_file, dtype='float32')
-        except:
-            # Fall back to ffmpeg for formats not supported by soundfile (MP3, OPUS, etc.)
-            audio_data, sample_rate = self._read_with_ffmpeg(audio_file)
         
         # Get number of channels
         if audio_data.ndim == 1:
@@ -342,7 +344,7 @@ class Arkive:
         # Determine format from file extension
         file_format = Path(audio_file).suffix.lower().lstrip('.')
         
-        return file_data, sample_rate, channels, len(audio_data), file_format, bit_depth
+        return file_data, audio_data, sample_rate, channels, len(audio_data), file_format, bit_depth
     
     def _read_with_ffmpeg(self, audio_file: str) -> tuple:
         """
