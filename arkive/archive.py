@@ -23,17 +23,22 @@ class Arkive:
     """Create and manage audio archives with mixed format support."""
     
     MAGIC_NUMBER = b'AUDARCH1'
-    MAX_BIN_SIZE = 32 * 1024 * 1024 * 1024  # 32 GB in bytes
+    MAX_BIN_SIZE = 32 * 1024 * 1024 * 1024  # default 32 GB in bytes
     
-    def __init__(self, archive_path: str):
+    def __init__(self, archive_dir: str):
         """
         Initialize audio archive.
-        
+
         Args:
-            archive_path: Path to the archive file (without extensions)
+            archive_dir: Path to the archive directory
+                archive_dir/
+                    audio_arkive_0.bin
+                    audio_arkive_1.bin (if over MAX_BIN_SIZE)
+                    ...
+                    metadata.parquet
         """
-        self.archive_path = Path(archive_path)
-        self.metadata_file = self.archive_path.with_suffix('.parquet')
+        self.archive_path = Path(archive_dir) / "audio_arkive"
+        self.metadata_file = Path(archive_dir) / "metadata.parquet"
 
         self.data = None
         if self.metadata_file.exists():
@@ -52,10 +57,7 @@ class Arkive:
         Returns:
             Path to the bin file
         """
-        if bin_index == 0:
-            return self.archive_path.with_suffix('.bin')
-        else:
-            return self.archive_path.with_name(f"{self.archive_path.stem}_{bin_index}.bin")
+        return self.archive_path.with_name(f"{self.archive_path.stem}_{bin_index}.bin")
     
     def _get_current_bin_info(self) -> tuple:
         """
