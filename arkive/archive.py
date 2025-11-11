@@ -180,11 +180,32 @@ class Arkive:
                     
                     current_offset += file_size
                     
+                    # Periodically flush buffer to disk to ensure data persistence
+                    # Note: fsync() ensures data is written to disk, but adds ~1-10ms overhead per call
+                    # Default flush_interval=10 provides good balance between safety and performance
+                    if flush_interval > 0 and (i + 1) % flush_interval == 0:
+                        try:
+                            current_bin_file.flush()
+                            os.fsync(current_bin_file.fileno())  # Force OS-level write to disk
+                            if show_progress:
+                                print(f"Flushed buffer to disk (processed {i + 1} files)")
+                        except (OSError, IOError) as e:
+                            # Log warning but continue processing
+                            print(f"Warning: Failed to flush data to disk: {e}")
+                            # Data is still in OS buffer and will be written eventually
+                    
                 except Exception as e:
                     print(f"Error processing {audio_file}: {e}")
                     continue
         
         finally:
+            # Final flush before closing to ensure all data is written
+            if flush_interval > 0:
+                try:
+                    current_bin_file.flush()
+                    os.fsync(current_bin_file.fileno())
+                except (OSError, IOError) as e:
+                    print(f"Warning: Failed to flush final data to disk: {e}")
             current_bin_file.close()
         
         # Append to existing metadata or create new
