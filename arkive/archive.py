@@ -98,6 +98,7 @@ class Arkive:
             flush_interval: Flush bin file buffer to disk every N files (default: 10). Set to 0 to disable periodic flushing.
         """
         metadata_records = []
+        processed_count = 0
         current_bin_index, current_offset = self._get_current_bin_info()
         
         # Validate parameters
@@ -179,6 +180,8 @@ class Arkive:
                     })
                     
                     current_offset += file_size
+
+                    processed_count += 1
                     
                     # Periodically flush buffer to disk to ensure data persistence
                     # Note: fsync() ensures data is written to disk, but adds ~1-10ms overhead per call
@@ -187,6 +190,24 @@ class Arkive:
                         try:
                             current_bin_file.flush()
                             os.fsync(current_bin_file.fileno())  # Force OS-level write to disk
+
+                            new_df = pd.DataFrame(metadata_records)
+                            if self.metadata_file.exists():
+                                # Load existing metadata and append
+                                existing_df = self.data
+                                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                                self.data = combined_df
+                                combined_df.to_parquet(self.metadata_file, index=False)
+                                
+                                if show_progress:
+                                    print(f"\nAppended {len(metadata_records)} files to existing archive!")
+                            else:
+                                # Create new metadata file
+                                new_df.to_parquet(self.metadata_file, index=False)
+                                self.data = new_df
+                            
+                            metadata_records = []
+                            
                             if show_progress:
                                 print(f"Flushed buffer to disk (processed {i + 1} files)")
                         except (OSError, IOError) as e:
@@ -204,31 +225,50 @@ class Arkive:
                 try:
                     current_bin_file.flush()
                     os.fsync(current_bin_file.fileno())
+
+                    new_df = pd.DataFrame(metadata_records)
+                    if self.metadata_file.exists():
+                        # Load existing metadata and append
+                        existing_df = self.data
+                        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                        self.data = combined_df
+                        combined_df.to_parquet(self.metadata_file, index=False)
+                        
+                        if show_progress:
+                            print(f"\nAppended {len(metadata_records)} files to existing archive!")
+                    else:
+                        # Create new metadata file
+                        new_df.to_parquet(self.metadata_file, index=False)
+                        self.data = new_df
+                    
+                    metadata_records = []
+                    
                 except (OSError, IOError) as e:
                     print(f"Warning: Failed to flush final data to disk: {e}")
             current_bin_file.close()
         
-        # Append to existing metadata or create new
-        new_df = pd.DataFrame(metadata_records)
-        
-        if self.metadata_file.exists():
-            # Load existing metadata and append
-            existing_df = self.data
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            self.data = combined_df
-            combined_df.to_parquet(self.metadata_file, index=False)
+        if not flush_interval > 0:
+            # Append to existing metadata or create new
+            new_df = pd.DataFrame(metadata_records)
             
-            if show_progress:
-                print(f"\nAppended {len(metadata_records)} files to existing archive!")
-        else:
-            # Create new metadata file
-            new_df.to_parquet(self.metadata_file, index=False)
-            self.data = new_df
+            if self.metadata_file.exists():
+                # Load existing metadata and append
+                existing_df = self.data
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                self.data = combined_df
+                combined_df.to_parquet(self.metadata_file, index=False)
+                
+                if show_progress:
+                    print(f"\nAppended {len(metadata_records)} files to existing archive!")
+            else:
+                # Create new metadata file
+                new_df.to_parquet(self.metadata_file, index=False)
+                self.data = new_df
         
         if show_progress:
             print(f"\nArchive created successfully!")
             print(f"Metadata file: {self.metadata_file}")
-            print(f"Total files: {len(metadata_records)}")
+            print(f"Total files: {processed_count}")
             
             # Show bin file statistics
             bin_indices = self.data['bin_index'].unique()
@@ -340,28 +380,45 @@ class Arkive:
             Tuple of (file_data, sample_rate, channels, duration, format, bit_depth)
         """
         # Read the file as binary
-        with open(audio_file, 'rb') as f:
-            file_data = f.read()
-        
-        # Get audio info for metadata
-        try:
-            audio_data, sample_rate = sf.read(audio_file, dtype='float32')
-            # Get bit depth from file info
-            info = sf.info(audio_file)
-            bit_depth = self._get_bit_depth_from_subtype(info.subtype)
-        except:
-            # Fall back to ffmpeg for formats not supported by soundfile
-            audio_data, sample_rate = self._read_with_ffmpeg(audio_file)
-            bit_depth = 16  # Default for ffmpeg conversion
-        
-        # Get number of channels
-        if audio_data.ndim == 1:
+        if ':' in audio_file and 'ark' in audio_file.lower():
+            # Temporarily used for OWSM data
+            try:
+                import kaldiio
+            except ImportError:
+                raise ImportError("kaldiio is not installed.")
+            sample_rate, audio_data = kaldiio.load_mat(audio_file)
+
             channels = 1
+            bit_depth = 16
+            file_format = 'flac'
+            buffer = io.BytesIO()
+            buffer.name = f'temp.flac'
+            sf.write(buffer, audio_data, sample_rate, format='FLAC', subtype='PCM_16')
+            buffer.seek(0)
+            file_data = buffer.read()
         else:
-            channels = audio_data.shape[1]
+            with open(audio_file, 'rb') as f:
+                file_data = f.read()
         
-        # Determine format from file extension
-        file_format = Path(audio_file).suffix.lower().lstrip('.')
+            # Get audio info for metadata
+            try:
+                audio_data, sample_rate = sf.read(audio_file, dtype='float32')
+                # Get bit depth from file info
+                info = sf.info(audio_file)
+                bit_depth = self._get_bit_depth_from_subtype(info.subtype)
+            except:
+                # Fall back to ffmpeg for formats not supported by soundfile
+                audio_data, sample_rate = self._read_with_ffmpeg(audio_file)
+                bit_depth = 16  # Default for ffmpeg conversion
+            
+            # Get number of channels
+            if audio_data.ndim == 1:
+                channels = 1
+            else:
+                channels = audio_data.shape[1]
+            
+            # Determine format from file extension
+            file_format = Path(audio_file).suffix.lower().lstrip('.')
         
         return file_data, audio_data, sample_rate, channels, len(audio_data), file_format, bit_depth
     
