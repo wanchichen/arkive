@@ -6,8 +6,13 @@ Converts mixed audio formats to 16-bit PCM FLAC and stores in a single archive w
 
 import io
 import os
+import itertools
+import warnings
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import (
+    List, Optional, Tuple, Union, Iterator,
+    Dict, Any, overload, BinaryIO
+)
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -21,12 +26,89 @@ from arkive.audio_read import generic_audio_read
 from arkive.definitions import AudioRead
 
 
+# Helper functions for audio processing
+def _get_bit_depth_from_subtype(subtype: str) -> int:
+    """
+    Get bit depth from soundfile subtype string.
+    
+    Args:
+        subtype: Subtype string from soundfile (e.g., 'PCM_16', 'PCM_24', 'FLOAT', 'DOUBLE')
+        
+    Returns:
+        Bit depth as integer
+    """
+    subtype_upper = subtype.upper()
+    
+    # PCM formats
+    if 'PCM_16' in subtype_upper or 'PCM16' in subtype_upper:
+        return 16
+    elif 'PCM_24' in subtype_upper or 'PCM24' in subtype_upper:
+        return 24
+    elif 'PCM_32' in subtype_upper or 'PCM32' in subtype_upper:
+        return 32
+    elif 'PCM_8' in subtype_upper or 'PCM8' in subtype_upper:
+        return 8
+    # Float formats
+    elif 'FLOAT' in subtype_upper and 'DOUBLE' not in subtype_upper:
+        return 32  # Single precision float
+    elif 'DOUBLE' in subtype_upper:
+        return 64  # Double precision float
+    # Default
+    else:
+        return 16  # Default to 16-bit if unknown
+
+
+def _convert_audio_data(
+    audio_data: np.ndarray,
+    sample_rate: int,
+    channels: int,
+    target_format: str,
+    target_bit_depth: int
+) -> Tuple[bytes, int]:
+    """
+    Convert audio data to target format and bit depth.
+    
+    Args:
+        audio_data: Audio data as numpy array
+        sample_rate: Sample rate in Hz
+        channels: Number of channels
+        target_format: Target format ('flac', 'wav', etc.)
+        target_bit_depth: Target bit depth (16, 32, or 64)
+        
+    Returns:
+        Tuple of (file_data_bytes, samples_count)
+    """
+    # Reshape if mono
+    if channels == 1:
+        audio_data = audio_data.reshape(-1, 1)
+    
+    # Determine subtype
+    if target_bit_depth == 16:
+        subtype = 'PCM_16'
+    elif target_bit_depth == 32:
+        subtype = 'PCM_32'
+    elif target_bit_depth == 64:
+        subtype = 'DOUBLE'
+    else:
+        raise ValueError(f"Unsupported target_bit_depth: {target_bit_depth}")
+    
+    # Convert to target format
+    out_buf = io.BytesIO()
+    out_buf.name = f'temp.{target_format}'
+    sf.write(out_buf, audio_data, sample_rate, 
+            subtype=subtype, format=target_format.upper())
+    out_buf.seek(0)
+    file_data = out_buf.read()
+    
+    return file_data, len(audio_data)
+
+
 # Static function for multiprocessing (must be at module level for pickle)
 def _process_single_audio_file_static(
     audio_file: str, target_format: Optional[str], target_bit_depth: int
 ) -> Optional[Tuple]:
     """
-    Static version of _process_single_audio_file for multiprocessing.
+    Process a single audio file to convert it to the target format and bit depth.
     This function must be at module level to be picklable.
     
     Returns:
@@ -56,20 +138,7 @@ def _process_single_audio_file_static(
             try:
                 audio_data, sample_rate = sf.read(audio_file, dtype='float32')
                 info = sf.info(audio_file)
-                # Get bit depth
-                subtype_upper = info.subtype.upper()
-                if 'PCM_16' in subtype_upper or 'PCM16' in subtype_upper:
-                    orig_bit_depth = 16
-                elif 'PCM_24' in subtype_upper or 'PCM24' in subtype_upper:
-                    orig_bit_depth = 24
-                elif 'PCM_32' in subtype_upper or 'PCM32' in subtype_upper:
-                    orig_bit_depth = 32
-                elif 'FLOAT' in subtype_upper and 'DOUBLE' not in subtype_upper:
-                    orig_bit_depth = 32
-                elif 'DOUBLE' in subtype_upper:
-                    orig_bit_depth = 64
-                else:
-                    orig_bit_depth = 16
+                orig_bit_depth = _get_bit_depth_from_subtype(info.subtype)
             except:
                 # Fallback - just return None, will be handled by error
                 print(f"Warning: Could not read {audio_file} with soundfile, skipping...")
@@ -91,27 +160,12 @@ def _process_single_audio_file_static(
                 needs_conversion = True
         
         if needs_conversion:
-            # Convert
-            if channels == 1:
-                audio_data = audio_data.reshape(-1, 1)
-            
-            if target_bit_depth == 16:
-                subtype = 'PCM_16'
-            elif target_bit_depth == 32:
-                subtype = 'PCM_32'
-            elif target_bit_depth == 64:
-                subtype = 'DOUBLE'
-            
-            out_buf = io.BytesIO()
-            out_buf.name = f'temp.{target_format}'
-            sf.write(out_buf, audio_data, sample_rate, 
-                    subtype=subtype, format=target_format.upper())
-            out_buf.seek(0)
-            file_data = out_buf.read()
-            
+            # Convert using helper function
+            file_data, samples = _convert_audio_data(
+                audio_data, sample_rate, channels, target_format, target_bit_depth
+            )
             file_format = target_format
             bit_depth = target_bit_depth
-            samples = len(audio_data)
         else:
             file_data = orig_file_data
             file_format = orig_format
@@ -157,21 +211,7 @@ def _process_audio_from_bytes_static(
             audio_data, sample_rate = sf.read(orig_buffer, dtype='float32')
             orig_buffer.seek(0)
             info = sf.info(orig_buffer)
-            
-            # Get bit depth
-            subtype_upper = info.subtype.upper()
-            if 'PCM_16' in subtype_upper or 'PCM16' in subtype_upper:
-                orig_bit_depth = 16
-            elif 'PCM_24' in subtype_upper or 'PCM24' in subtype_upper:
-                orig_bit_depth = 24
-            elif 'PCM_32' in subtype_upper or 'PCM32' in subtype_upper:
-                orig_bit_depth = 32
-            elif 'FLOAT' in subtype_upper and 'DOUBLE' not in subtype_upper:
-                orig_bit_depth = 32
-            elif 'DOUBLE' in subtype_upper:
-                orig_bit_depth = 64
-            else:
-                orig_bit_depth = 16
+            orig_bit_depth = _get_bit_depth_from_subtype(info.subtype)
         except Exception as e:
             print(f"Warning: Could not read audio {audio_key}: {e}")
             return None
@@ -190,27 +230,12 @@ def _process_audio_from_bytes_static(
                 needs_conversion = True
         
         if needs_conversion:
-            # Convert
-            if channels == 1:
-                audio_data = audio_data.reshape(-1, 1)
-            
-            if target_bit_depth == 16:
-                subtype = 'PCM_16'
-            elif target_bit_depth == 32:
-                subtype = 'PCM_32'
-            elif target_bit_depth == 64:
-                subtype = 'DOUBLE'
-            
-            out_buf = io.BytesIO()
-            out_buf.name = f'temp.{target_format}'
-            sf.write(out_buf, audio_data, sample_rate, 
-                    subtype=subtype, format=target_format.upper())
-            out_buf.seek(0)
-            file_data = out_buf.read()
-            
+            # Convert using helper function
+            file_data, samples = _convert_audio_data(
+                audio_data, sample_rate, channels, target_format, target_bit_depth
+            )
             file_format = target_format
             bit_depth = target_bit_depth
-            samples = len(audio_data)
         else:
             # No conversion needed, use original bytes
             file_data = audio_bytes
@@ -223,6 +248,34 @@ def _process_audio_from_bytes_static(
     except Exception as e:
         print(f"Error processing audio {audio_item.get('key', 'unknown')}: {e}")
         return None
+
+
+def _process_item_unified(
+    item: Union[str, dict], target_format: Optional[str], target_bit_depth: int
+) -> Optional[Tuple]:
+    """
+    Unified processing function that automatically selects the appropriate handler
+    based on item type.
+    
+    Args:
+        item: Either a file path (str) or a bytes dict with keys:
+            - 'bytes': audio file bytes
+            - 'key': unique identifier
+            - 'format': original format
+        target_format: Target format for conversion
+        target_bit_depth: Target bit depth
+        
+    Returns:
+        Tuple of (identifier, file_data, sample_rate, channels, samples, format, bit_depth) or None if failed
+    """
+    if isinstance(item, str):
+        # File path type
+        return _process_single_audio_file_static(item, target_format, target_bit_depth)
+    elif isinstance(item, dict):
+        # Bytes stream type
+        return _process_audio_from_bytes_static(item, target_format, target_bit_depth)
+    else:
+        raise TypeError(f"Unsupported item type: {type(item)}. Expected str (file path) or dict (bytes stream)")
 
 
 class Arkive:
@@ -285,26 +338,95 @@ class Arkive:
                     prev_bin_path = self._get_bin_file_path(bin_index - 1)
                     return bin_index - 1, prev_bin_path.stat().st_size
             bin_index += 1
-
-    def append(
-        self, 
-        audio_files: List[str],
-        target_format: Optional[str] = 'flac', 
-        show_progress: bool = False,
-        target_bit_depth: int = 16,
-        flush_interval: int = 10,
-        num_workers: int = None
-    ):
+    
+    def _write_result_to_bin(
+        self,
+        result: Tuple,
+        current_bin_file: BinaryIO,
+        current_bin_index: int,
+        current_offset: int,
+        item_type: str,
+        show_progress: bool
+    ) -> Tuple[BinaryIO, int, int, dict]:
         """
-        Create a new archive from a list of audio files (with multiprocessing support).
+        Write a processed result to bin file and create metadata record.
         
         Args:
-            audio_files: List of paths to audio files (WAV, FLAC, MP3, OPUS, etc.)
-            target_format: Target format for conversion ('flac', 'wav', 'mp3', 'opus', or None to retain original)
+            result: Tuple from processing function (identifier, file_data, sample_rate, channels, samples, format, bit_depth)
+            current_bin_file: Current bin file handle
+            current_bin_index: Current bin file index
+            current_offset: Current byte offset in bin file
+            item_type: 'file' or 'bytes'
             show_progress: Whether to show progress messages
-            target_bit_depth: Target bit depth for conversion (16, 32, or 64). Only applies when target_format is not None.
-            flush_interval: Flush bin file buffer to disk every N files (default: 10). Set to 0 to disable periodic flushing.
-            num_workers: Number of worker processes for parallel processing (default: cpu_count() - 1, set to 1 to disable)
+            
+        Returns:
+            Tuple of (updated_bin_file, updated_bin_index, updated_offset, metadata_record)
+        """
+        identifier, file_data, sample_rate, channels, samples, file_format, bit_depth = result
+        file_size = len(file_data)
+        
+        # Check if we need to create a new bin file
+        if current_offset + file_size > self.MAX_BIN_SIZE:
+            current_bin_file.close()
+            current_bin_index += 1
+            current_offset = 0
+            current_bin_path = self._get_bin_file_path(current_bin_index)
+            current_bin_file = open(current_bin_path, 'wb')
+            if show_progress:
+                print(f"\nCreating new bin file: {current_bin_path.name} (previous bin full)")
+        
+        # Determine identifier field based on item type
+        if item_type == 'file' or (isinstance(identifier, str) and Path(identifier).exists()):
+            original_file_path = str(Path(identifier).absolute())
+        else:
+            original_file_path = identifier  # Use key for bytes type
+        
+        # Write to bin file
+        current_bin_file.write(file_data)
+        
+        # Create metadata record
+        current_bin_path = self._get_bin_file_path(current_bin_index)
+        metadata_record = {
+            'original_file_path': original_file_path,
+            'bin_index': current_bin_index,
+            'path': str(current_bin_path),
+            'start_byte_offset': current_offset,
+            'file_size_bytes': file_size,
+            'sample_rate': sample_rate,
+            'channels': channels,
+            'length': samples,
+            'format': file_format,
+            'bit_depth': bit_depth
+        }
+        
+        # Update offset
+        current_offset += file_size
+        
+        return current_bin_file, current_bin_index, current_offset, metadata_record
+
+    def _append_items(
+        self,
+        items_iterator: Iterator[Union[str, Dict[str, Any]]],
+        target_format: Optional[str] = 'flac',
+        target_bit_depth: int = 16,
+        show_progress: bool = False,
+        flush_interval: int = 10,
+        num_workers: int = None,
+        batch_size: Optional[int] = None,
+        item_type: str = 'auto'
+    ):
+        """
+        Unified internal append method that handles all common logic.
+        
+        Args:
+            items_iterator: Iterator yielding unified item format (str for file paths, dict for bytes)
+            target_format: Target format for conversion
+            target_bit_depth: Target bit depth
+            show_progress: Whether to show progress messages
+            flush_interval: Flush bin file buffer to disk every N files (0 to disable)
+            num_workers: Number of worker processes (default: cpu_count() - 1)
+            batch_size: Batch size for processing (None means no batching, mainly for bytes type)
+            item_type: 'file' for file paths, 'bytes' for bytes streams, 'auto' for auto-detection
         """
         metadata_records = []
         processed_count = 0
@@ -329,105 +451,92 @@ class Arkive:
         current_bin_file = open(current_bin_path, 'ab')
         
         try:
-            # Use multiprocessing if num_workers > 1
-            if num_workers > 1:
-                pool = Pool(processes=num_workers)
-                process_func = partial(
-                    _process_single_audio_file_static,
-                    target_format=target_format,
-                    target_bit_depth=target_bit_depth
-                )
-                
-                # Process files in parallel
-                # imap_unordered is faster than imap
-                # Since we do not consider the order of audio paths, we can write
-                # any audio file if it is available.
-                results_iter = pool.imap_unordered(process_func, audio_files)
-                if show_progress:
-                    results_iter = tqdm(results_iter, total=len(audio_files), desc="Processing audio files")
-                
-                # NOTE(qingzheng): we cannot do parallel write into *single .bin* file, as:
-                # 1. we need to keep the order of current_offset
-                # 2. there is a system lock for the .bin file write
-                for i, result in enumerate(results_iter):
-                    if result is None:
-                        continue
-                    
-                    audio_file, file_data, sample_rate, channels, samples, file_format, bit_depth = result
-                    file_size = len(file_data)
-                    
-                    # Check if we need to create a new bin file
-                    if current_offset + file_size > self.MAX_BIN_SIZE:
-                        current_bin_file.close()
-                        current_bin_index += 1
-                        current_offset = 0
-                        current_bin_path = self._get_bin_file_path(current_bin_index)
-                        current_bin_file = open(current_bin_path, 'wb')
-                        if show_progress:
-                            print(f"\nCreating new bin file: {current_bin_path.name} (previous bin full)")
-                    
-                    # Write to bin file and record metadata
-                    current_bin_file.write(file_data)
-                    metadata_records.append({
-                        'original_file_path': str(Path(audio_file).absolute()),
-                        'bin_index': current_bin_index,
-                        'path': str(current_bin_path),
-                        'start_byte_offset': current_offset,
-                        'file_size_bytes': file_size,
-                        'sample_rate': sample_rate,
-                        'channels': channels,
-                        'length': samples,
-                        'format': file_format,
-                        'bit_depth': bit_depth
-                    })
-                    current_offset += file_size
-                    processed_count += 1
-                    
-                    # Periodic flush
-                    if flush_interval > 0 and (i + 1) % flush_interval == 0:
-                        self._flush_data(current_bin_file, metadata_records, show_progress, i + 1)
-                        metadata_records = []
-                
-                pool.close()
-                pool.join()
+            # Determine if we need batch processing
+            use_batch_processing = (batch_size is not None and batch_size > 0)
             
+            if use_batch_processing:
+                # Batch processing mode (mainly for bytes type)
+                batch = []
+                items_with_progress = tqdm(items_iterator, desc="Processing audios") if show_progress else items_iterator
+                
+                for item in items_with_progress:
+                    batch.append(item)
+                    
+                    # When batch is full, process it
+                    if len(batch) >= batch_size:
+                        current_bin_file, current_bin_index, current_offset, processed_count, metadata_records = \
+                            self._process_batch(
+                                batch,
+                                current_bin_file,
+                                current_bin_index,
+                                current_offset,
+                                processed_count,
+                                metadata_records,
+                                target_format,
+                                target_bit_depth,
+                                num_workers,
+                                show_progress,
+                                flush_interval,
+                                item_type
+                            )
+                        batch = []  # Clear batch to free memory
+                
+                # Process remaining batch
+                if batch:
+                    current_bin_file, current_bin_index, current_offset, processed_count, metadata_records = \
+                        self._process_batch(
+                            batch,
+                            current_bin_file,
+                            current_bin_index,
+                            current_offset,
+                            processed_count,
+                            metadata_records,
+                            target_format,
+                            target_bit_depth,
+                            num_workers,
+                            show_progress,
+                            flush_interval,
+                            item_type
+                        )
             else:
-                # Single process mode (original logic)
-                iter_obj = tqdm(enumerate(audio_files), total=len(audio_files), desc="Processing audio files") if show_progress else enumerate(audio_files)
-                for i, audio_file in iter_obj:
-                    try:
-                        result = self._process_single_audio_file(audio_file, target_format, target_bit_depth)
+                # Non-batch processing mode (for file paths or when batch_size is None)
+                # Convert to list if needed for progress bar total
+                if isinstance(items_iterator, list):
+                    total = len(items_iterator)
+                    items_iter = iter(items_iterator)
+                elif hasattr(items_iterator, '__len__'):
+                    total = len(items_iterator)
+                    items_iter = items_iterator
+                else:
+                    # For iterators without length, we can't show total
+                    items_iter = items_iterator
+                    total = None
+                
+                # Use multiprocessing if num_workers > 1
+                if num_workers > 1:
+                    pool = Pool(processes=num_workers)
+                    process_func = partial(
+                        _process_item_unified,
+                        target_format=target_format,
+                        target_bit_depth=target_bit_depth
+                    )
+                    
+                    # Process items in parallel
+                    results_iter = pool.imap_unordered(process_func, items_iter)
+                    if show_progress:
+                        results_iter = tqdm(results_iter, total=total, desc="Processing audio files")
+                    
+                    for i, result in enumerate(results_iter):
                         if result is None:
                             continue
                         
-                        _, file_data, sample_rate, channels, samples, file_format, bit_depth = result
-                        file_size = len(file_data)
-                        
-                        # Check if we need to create a new bin file
-                        if current_offset + file_size > self.MAX_BIN_SIZE:
-                            current_bin_file.close()
-                            current_bin_index += 1
-                            current_offset = 0
-                            current_bin_path = self._get_bin_file_path(current_bin_index)
-                            current_bin_file = open(current_bin_path, 'wb')
-                            if show_progress:
-                                print(f"\nCreating new bin file: {current_bin_path.name} (previous bin full)")
-                        
-                        # Write to bin file and record metadata
-                        current_bin_file.write(file_data)
-                        metadata_records.append({
-                            'original_file_path': str(Path(audio_file).absolute()),
-                            'bin_index': current_bin_index,
-                            'path': str(current_bin_path),
-                            'start_byte_offset': current_offset,
-                            'file_size_bytes': file_size,
-                            'sample_rate': sample_rate,
-                            'channels': channels,
-                            'length': samples,
-                            'format': file_format,
-                            'bit_depth': bit_depth
-                        })
-                        current_offset += file_size
+                        # Write result to bin file and get metadata
+                        current_bin_file, current_bin_index, current_offset, metadata_record = \
+                            self._write_result_to_bin(
+                                result, current_bin_file, current_bin_index, current_offset,
+                                item_type, show_progress
+                            )
+                        metadata_records.append(metadata_record)
                         processed_count += 1
                         
                         # Periodic flush
@@ -435,9 +544,35 @@ class Arkive:
                             self._flush_data(current_bin_file, metadata_records, show_progress, i + 1)
                             metadata_records = []
                     
-                    except Exception as e:
-                        print(f"Error processing {audio_file}: {e}")
-                        continue
+                    pool.close()
+                    pool.join()
+                else:
+                    # Single process mode
+                    items_with_progress = tqdm(enumerate(items_iter), total=total, desc="Processing audio files") if show_progress else enumerate(items_iter)
+                    for i, item in items_with_progress:
+                        try:
+                            result = _process_item_unified(item, target_format, target_bit_depth)
+                            if result is None:
+                                continue
+                            
+                            # Write result to bin file and get metadata
+                            current_bin_file, current_bin_index, current_offset, metadata_record = \
+                                self._write_result_to_bin(
+                                    result, current_bin_file, current_bin_index, current_offset,
+                                    item_type, show_progress
+                                )
+                            metadata_records.append(metadata_record)
+                            processed_count += 1
+                            
+                            # Periodic flush
+                            if flush_interval > 0 and (i + 1) % flush_interval == 0:
+                                self._flush_data(current_bin_file, metadata_records, show_progress, i + 1)
+                                metadata_records = []
+                        
+                        except Exception as e:
+                            item_str = item if isinstance(item, str) else item.get('key', 'unknown')
+                            print(f"Error processing {item_str}: {e}")
+                            continue
         
         finally:
             # Final flush before closing to ensure all data is written
@@ -446,8 +581,8 @@ class Arkive:
                 metadata_records = []
             current_bin_file.close()
         
+        # Save remaining metadata if not using flush
         if not flush_interval > 0:
-            # Append to existing metadata or create new
             new_df = pd.DataFrame(metadata_records)
             
             if self.metadata_file.exists():
@@ -470,17 +605,185 @@ class Arkive:
             print(f"Total files: {processed_count}")
             
             # Show bin file statistics
-            bin_indices = self.data['bin_index'].unique()
-            for bin_idx in sorted(bin_indices):
-                bin_path = self._get_bin_file_path(bin_idx)
-                bin_size = bin_path.stat().st_size if bin_path.exists() else 0
-                file_count = len(self.data[self.data['bin_index'] == bin_idx])
-                print(f"  {bin_path.name}: {bin_size / (1024**3):.2f} GB ({file_count} files)")
+            if self.data is not None:
+                bin_indices = self.data['bin_index'].unique()
+                for bin_idx in sorted(bin_indices):
+                    bin_path = self._get_bin_file_path(bin_idx)
+                    bin_size = bin_path.stat().st_size if bin_path.exists() else 0
+                    file_count = len(self.data[self.data['bin_index'] == bin_idx])
+                    print(f"  {bin_path.name}: {bin_size / (1024**3):.2f} GB ({file_count} files)")
+                
+                total_size = sum((self._get_bin_file_path(idx).stat().st_size 
+                                for idx in bin_indices 
+                                if self._get_bin_file_path(idx).exists()))
+                print(f"Total size: {total_size / (1024**3):.2f} GB")
+    
+    def _process_batch(
+        self,
+        batch: List[Union[str, Dict[str, Any]]],
+        current_bin_file,
+        current_bin_index: int,
+        current_offset: int,
+        processed_count: int,
+        metadata_records: List[dict],
+        target_format: Optional[str],
+        target_bit_depth: int,
+        num_workers: int,
+        show_progress: bool,
+        flush_interval: int,
+        item_type: str
+    ):
+        """Process a batch of items with parallel processing."""
+        
+        # Create process pool for this batch
+        pool = Pool(processes=num_workers)
+        process_func = partial(
+            _process_item_unified,
+            target_format=target_format,
+            target_bit_depth=target_bit_depth
+        )
+        
+        # Process batch in parallel (use imap_unordered to avoid bubble)
+        results_iter = pool.imap_unordered(process_func, batch)
+        
+        for result in results_iter:
+            if result is None:
+                continue
             
-            total_size = sum((self._get_bin_file_path(idx).stat().st_size 
-                            for idx in bin_indices 
-                            if self._get_bin_file_path(idx).exists()))
-            print(f"Total size: {total_size / (1024**3):.2f} GB")
+            # Write result to bin file and get metadata
+            current_bin_file, current_bin_index, current_offset, metadata_record = \
+                self._write_result_to_bin(
+                    result, current_bin_file, current_bin_index, current_offset,
+                    item_type, show_progress
+                )
+            metadata_records.append(metadata_record)
+            processed_count += 1
+            
+            # Periodic flush
+            if flush_interval > 0 and processed_count % flush_interval == 0:
+                self._flush_data(current_bin_file, metadata_records, show_progress, processed_count)
+                metadata_records = []
+        
+        pool.close()
+        pool.join()
+        
+        return current_bin_file, current_bin_index, current_offset, processed_count, metadata_records
+
+    @overload
+    def append(
+        self,
+        items: List[str],
+        target_format: Optional[str] = 'flac',
+        target_bit_depth: int = 16,
+        show_progress: bool = False,
+        flush_interval: int = 10,
+        num_workers: int = None,
+        batch_size: Optional[int] = None
+    ) -> None: ...
+    
+    @overload
+    def append(
+        self,
+        items: Iterator[str],
+        target_format: Optional[str] = 'flac',
+        target_bit_depth: int = 16,
+        show_progress: bool = False,
+        flush_interval: int = 10,
+        num_workers: int = None,
+        batch_size: Optional[int] = None
+    ) -> None: ...
+    
+    @overload
+    def append(
+        self,
+        items: Iterator[Dict[str, Any]],
+        target_format: Optional[str] = 'flac',
+        target_bit_depth: int = 16,
+        show_progress: bool = False,
+        flush_interval: int = 100,
+        num_workers: int = None,
+        batch_size: int = 200
+    ) -> None: ...
+    
+    def append(
+        self,
+        items: Union[List[str], Iterator[str], Iterator[Dict[str, Any]]],
+        target_format: Optional[str] = 'flac',
+        target_bit_depth: int = 16,
+        show_progress: bool = False,
+        flush_interval: int = 100,
+        num_workers: int = None,
+        batch_size: Optional[int] = None
+    ):
+        """
+        Unified append interface that automatically detects input type.
+        
+        Supports multiple input formats:
+        - List[str]: List of file paths
+        - Iterator[str]: Iterator of file paths
+        - Iterator[dict]: Iterator of bytes dicts with keys:
+            - 'bytes': audio file bytes
+            - 'key': unique identifier
+            - 'format': original format (e.g., 'mp3', 'flac')
+            - 'metadata': optional metadata dict
+        
+        Args:
+            items: Input items (file paths or bytes dicts)
+            target_format: Target format for conversion ('flac', 'wav', 'mp3', 'opus', or None to retain original)
+            target_bit_depth: Target bit depth for conversion (16, 32, or 64). Only applies when target_format is not None.
+            show_progress: Whether to show progress messages
+            flush_interval: Flush bin file buffer to disk every N files (default: 10 for files, 100 for bytes). Set to 0 to disable periodic flushing.
+            num_workers: Number of worker processes for parallel processing (default: cpu_count() - 1, set to 1 to disable)
+            batch_size: Batch size for processing (only effective for bytes type, default: 200). Ignored for file paths.
+        
+        Examples:
+            # File path list
+            archive.append(['file1.wav', 'file2.mp3'])
+            
+            # File path iterator
+            archive.append(Path('audio_dir').glob('*.wav'))
+            
+            # Bytes stream iterator
+            archive.append(audio_bytes_iterator, batch_size=200)
+        """
+        # Auto-detect input type
+        items_iter = iter(items)
+        first_item = next(items_iter, None)
+        
+        if first_item is None:
+            return  # Empty input
+        
+        # Rebuild iterator (including first item)
+        items_iter = itertools.chain([first_item], items_iter)
+        
+        # Detect type
+        if isinstance(first_item, str):
+            # File path type
+            item_type = 'file'
+            if batch_size is not None:
+                warnings.warn("batch_size is ignored for file path inputs", UserWarning)
+            batch_size = None
+        elif isinstance(first_item, dict):
+            # Bytes stream type
+            item_type = 'bytes'
+            if batch_size is None:
+                batch_size = 200  # Default batch size for bytes
+        else:
+            raise TypeError(
+                f"Unsupported item type: {type(first_item)}. "
+                "Expected str (file path) or dict (bytes stream)"
+            )
+        
+        return self._append_items(
+            items_iter,
+            target_format=target_format,
+            target_bit_depth=target_bit_depth,
+            show_progress=show_progress,
+            flush_interval=flush_interval,
+            num_workers=num_workers,
+            batch_size=batch_size,
+            item_type=item_type
+        )
     
     def append_from_bytes(
         self, 
@@ -494,6 +797,9 @@ class Arkive:
     ):
         """
         Append audio from bytes (streaming, memory-efficient).
+        
+        .. deprecated:: 2.0
+            Use :meth:`append` instead. This method will be removed in a future version.
         
         This method processes audio from an iterator of byte streams, which is more
         memory-efficient than loading all audio into memory at once.
@@ -511,219 +817,29 @@ class Arkive:
             flush_interval: Flush metadata every N files
             num_workers: Number of worker processes (default: cpu_count() - 1)
         """
-        # Validate parameters
-        if target_format is not None:
-            target_format = target_format.lower()
-            valid_formats = ['flac', 'wav', 'mp3', 'opus']
-            if target_format not in valid_formats:
-                raise ValueError(f"target_format must be one of {valid_formats} or None")
-        
-        if target_bit_depth not in [16, 32, 64]:
-            raise ValueError(f"target_bit_depth must be 16, 32, or 64, got {target_bit_depth}")
-        
-        # Determine number of workers
-        if num_workers is None:
-            num_workers = max(1, cpu_count() - 1)
-        
-        # Get current bin info
-        current_bin_index, current_offset = self._get_current_bin_info()
-        
-        # Open bin file for appending
-        current_bin_path = self._get_bin_file_path(current_bin_index)
-        current_bin_file = open(current_bin_path, 'ab')
-        
-        metadata_records = []
-        processed_count = 0
-        
-        try:
-            # Process in batches
-            batch = []
-
-            if show_progress:
-                audio_bytes_iterator = tqdm(audio_bytes_iterator, desc="Processing audios")
-            
-            for audio_item in audio_bytes_iterator:
-                batch.append(audio_item)
-                
-                # When batch is full, process it
-                if len(batch) >= batch_size:
-                    current_bin_file, current_bin_index, current_offset, processed_count, metadata_records = \
-                        self._process_bytes_batch(
-                            batch, 
-                            current_bin_file,
-                            current_bin_index,
-                            current_offset,
-                            processed_count,
-                            metadata_records,
-                            target_format,
-                            target_bit_depth,
-                            num_workers,
-                            show_progress,
-                            flush_interval
-                        )
-                    batch = []  # Clear batch to free memory
-            
-            # Process remaining batch
-            if batch:
-                current_bin_file, current_bin_index, current_offset, processed_count, metadata_records = \
-                    self._process_bytes_batch(
-                        batch,
-                        current_bin_file,
-                        current_bin_index,
-                        current_offset,
-                        processed_count,
-                        metadata_records,
-                        target_format,
-                        target_bit_depth,
-                        num_workers,
-                        show_progress,
-                        flush_interval
-                    )
-        
-        finally:
-            # Final flush
-            if flush_interval > 0 and metadata_records:
-                self._flush_data(current_bin_file, metadata_records, show_progress, processed_count)
-                metadata_records = []
-            current_bin_file.close()
-        
-        # Save remaining metadata if not using flush
-        if not flush_interval > 0:
-            new_df = pd.DataFrame(metadata_records)
-            
-            if self.metadata_file.exists():
-                existing_df = self.data
-                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                self.data = combined_df
-                combined_df.to_parquet(self.metadata_file, index=False)
-                
-                if show_progress:
-                    print(f"\nAppended {len(metadata_records)} files to existing archive!")
-            else:
-                new_df.to_parquet(self.metadata_file, index=False)
-                self.data = new_df
-        
-        if show_progress:
-            print(f"\nArchive created successfully!")
-            print(f"Total files processed: {processed_count}")
-    
-    def _process_bytes_batch(
-        self,
-        batch: List[dict],
-        current_bin_file,
-        current_bin_index: int,
-        current_offset: int,
-        processed_count: int,
-        metadata_records: List[dict],
-        target_format: Optional[str],
-        target_bit_depth: int,
-        num_workers: int,
-        show_progress: bool,
-        flush_interval: int
-    ):
-        """Process a batch of audio bytes with parallel processing."""
-        
-        # Create process pool for this batch
-        pool = Pool(processes=num_workers)
-        process_func = partial(
-            _process_audio_from_bytes_static,
-            target_format=target_format,
-            target_bit_depth=target_bit_depth
+        warnings.warn(
+            "append_from_bytes is deprecated. Use append() instead. "
+            "append_from_bytes will be removed in v2.0",
+            DeprecationWarning,
+            stacklevel=2
         )
-        
-        # Process batch in parallel (use imap_unordered to avoid bubble)
-        results_iter = pool.imap_unordered(process_func, batch)
-        
-        for result in results_iter:
-            if result is None:
-                continue
-            
-            audio_key, file_data, sample_rate, channels, samples, file_format, bit_depth = result
-            file_size = len(file_data)
-            
-            # Check if we need to create a new bin file
-            if current_offset + file_size > self.MAX_BIN_SIZE:
-                current_bin_file.close()
-                current_bin_index += 1
-                current_offset = 0
-                current_bin_path = self._get_bin_file_path(current_bin_index)
-                current_bin_file = open(current_bin_path, 'wb')
-                if show_progress:
-                    print(f"\nCreating new bin file: {current_bin_path.name} (previous bin full)")
-            
-            # Write to bin file and record metadata
-            current_bin_file.write(file_data)
-            metadata_records.append({
-                'original_file_path': audio_key,  # Use key as identifier
-                'bin_index': current_bin_index,
-                'path': str(self._get_bin_file_path(current_bin_index)),
-                'start_byte_offset': current_offset,
-                'file_size_bytes': file_size,
-                'sample_rate': sample_rate,
-                'channels': channels,
-                'length': samples,
-                'format': file_format,
-                'bit_depth': bit_depth
-            })
-            current_offset += file_size
-            processed_count += 1
-            
-            # Periodic flush
-            if flush_interval > 0 and processed_count % flush_interval == 0:
-                self._flush_data(current_bin_file, metadata_records, show_progress, processed_count)
-                metadata_records = []
-        
-        pool.close()
-        pool.join()
-        
-        return current_bin_file, current_bin_index, current_offset, processed_count, metadata_records
+        return self.append(
+            audio_bytes_iterator,
+            batch_size=batch_size,
+            target_format=target_format,
+            target_bit_depth=target_bit_depth,
+            show_progress=show_progress,
+            flush_interval=flush_interval,
+            num_workers=num_workers
+        )
     
-    def _process_single_audio_file(self, audio_file: str, target_format: Optional[str], 
-                                    target_bit_depth: int) -> Optional[Tuple]:
-        """
-        Process a single audio file (read and convert if needed).
-        
-        Args:
-            audio_file: Path to audio file
-            target_format: Target format for conversion
-            target_bit_depth: Target bit depth
-            
-        Returns:
-            Tuple of (audio_file, file_data, sample_rate, channels, samples, format, bit_depth) or None if failed
-        """
-        try:
-            # Read original format
-            orig_file_data, orig_audio_data, orig_sample_rate, orig_channels, \
-                orig_samples, orig_format, orig_bit_depth = self._read_original_format(audio_file)
-            
-            # Determine if conversion is needed
-            needs_conversion = False
-            if target_format is not None:
-                if orig_format != target_format or orig_bit_depth != target_bit_depth:
-                    needs_conversion = True
-            
-            if needs_conversion:
-                file_data, sample_rate, channels, samples = self._convert_to_format(
-                    orig_audio_data, orig_sample_rate, orig_channels, target_format, target_bit_depth
-                )
-                file_format = target_format
-                bit_depth = target_bit_depth
-            else:
-                file_data = orig_file_data
-                sample_rate = orig_sample_rate
-                channels = orig_channels
-                samples = orig_samples
-                file_format = orig_format
-                bit_depth = orig_bit_depth
-            
-            return (audio_file, file_data, sample_rate, channels, samples, file_format, bit_depth)
-        
-        except Exception as e:
-            print(f"Error processing {audio_file}: {e}")
-            return None
-    
-    def _flush_data(self, current_bin_file, metadata_records: List[dict], 
-                    show_progress: bool, file_count: int):
+    def _flush_data(
+        self,
+        current_bin_file: BinaryIO,
+        metadata_records: List[dict],
+        show_progress: bool,
+        file_count: int
+    ):
         """
         Flush bin file and metadata to disk.
         
@@ -750,146 +866,7 @@ class Arkive:
         
         except (OSError, IOError) as e:
             print(f"Warning: Failed to flush data to disk: {e}")
-    
-    def _get_bit_depth_from_subtype(self, subtype: str) -> int:
-        """
-        Get bit depth from soundfile subtype string.
         
-        Args:
-            subtype: Subtype string from soundfile (e.g., 'PCM_16', 'PCM_24', 'FLOAT', 'DOUBLE')
-            
-        Returns:
-            Bit depth as integer
-        """
-        subtype_upper = subtype.upper()
-        
-        # PCM formats
-        if 'PCM_16' in subtype_upper or 'PCM16' in subtype_upper:
-            return 16
-        elif 'PCM_24' in subtype_upper or 'PCM24' in subtype_upper:
-            return 24
-        elif 'PCM_32' in subtype_upper or 'PCM32' in subtype_upper:
-            return 32
-        elif 'PCM_8' in subtype_upper or 'PCM8' in subtype_upper:
-            return 8
-        # Float formats
-        elif 'FLOAT' in subtype_upper and 'DOUBLE' not in subtype_upper:
-            return 32  # Single precision float
-        elif 'DOUBLE' in subtype_upper:
-            return 64  # Double precision float
-        # Default
-        else:
-            return 16  # Default to 16-bit if unknown
-    
-    def _convert_to_format(
-        self,
-        audio_data: np.ndarray,
-        sample_rate: int,
-        channels: int,
-        target_format: str,
-        target_bit_depth: int
-    ) -> tuple:
-        """
-        Convert audio file to specified format and bit depth.
-        
-        Args:
-            audio_data: Audio data as numpy array
-            sample_rate: Sample rate in Hz
-            channels: Number of channels (will be recalculated from audio_data if inconsistent)
-            target_format: Target format ('flac', 'wav', 'mp3', 'opus')
-            target_bit_depth: Bit depth (16, 32, or 64)
-            
-        Returns:
-            Tuple of (file_data, sample_rate, channels, samples)
-        """
-        
-        # Get number of channels from audio data (recalculate to ensure consistency)
-        if channels == 1:
-            audio_data = audio_data.reshape(-1, 1)
-        
-        # Convert to target bit depth
-        if target_bit_depth == 16:
-            subtype = 'PCM_16'
-        elif target_bit_depth == 32:
-            subtype = 'PCM_32'
-        elif target_bit_depth == 64:
-            subtype = 'DOUBLE'  # 64-bit float for FLAC/WAV
-        
-        if target_format in ['flac', 'wav']:
-            # Use soundfile for FLAC and WAV
-            # tempfile.SpooledTemporaryFile may be a better solution
-            out_buf = io.BytesIO()
-            out_buf.name = f'temp.{target_format}'
-            sf.write(out_buf, audio_data, sample_rate, 
-                    subtype=subtype, format=target_format.upper())
-            out_buf.seek(0)
-            audio_binary = out_buf.read()
-        elif target_format in ['mp3', 'opus']:
-            # Use ffmpeg for MP3 and OPUS
-            raise NotImplementedError("Not yet validated")
-            #with tempfile.NamedTemporaryFile(suffix=f'.{target_format}', delete=False) as tmp_file:
-            #    tmp_path = tmp_file.name
-            #self._write_with_ffmpeg(audio_data, sample_rate, tmp_path, target_format, target_bit_depth)
-        
-            # Read the file as binary
-            #with open(tmp_path, 'rb') as f:
-            #    audio_binary = f.read()
-        
-        return audio_binary, sample_rate, channels, len(audio_data)
-    
-    def _read_original_format(self, audio_file: str) -> tuple:
-        """
-        Read audio file in its original format without conversion.
-        
-        Args:
-            audio_file: Path to input audio file
-            
-        Returns:
-            Tuple of (file_data, sample_rate, channels, duration, format, bit_depth)
-        """
-        # Read the file as binary
-        if ':' in audio_file and 'ark' in audio_file.lower():
-            # Temporarily used for OWSM data
-            try:
-                import kaldiio
-            except ImportError:
-                raise ImportError("kaldiio is not installed.")
-            sample_rate, audio_data = kaldiio.load_mat(audio_file)
-
-            channels = 1
-            bit_depth = 16
-            file_format = 'flac'
-            buffer = io.BytesIO()
-            buffer.name = f'temp.flac'
-            sf.write(buffer, audio_data, sample_rate, format='FLAC', subtype='PCM_16')
-            buffer.seek(0)
-            file_data = buffer.read()
-        else:
-            with open(audio_file, 'rb') as f:
-                file_data = f.read()
-        
-            # Get audio info for metadata
-            try:
-                audio_data, sample_rate = sf.read(audio_file, dtype='float32')
-                # Get bit depth from file info
-                info = sf.info(audio_file)
-                bit_depth = self._get_bit_depth_from_subtype(info.subtype)
-            except:
-                # Fall back to ffmpeg for formats not supported by soundfile
-                audio_data, sample_rate = self._read_with_ffmpeg(audio_file)
-                bit_depth = 16  # Default for ffmpeg conversion
-            
-            # Get number of channels
-            if audio_data.ndim == 1:
-                channels = 1
-            else:
-                channels = audio_data.shape[1]
-            
-            # Determine format from file extension
-            file_format = Path(audio_file).suffix.lower().lstrip('.')
-        
-        return file_data, audio_data, sample_rate, channels, len(audio_data), file_format, bit_depth
-    
     def _read_with_ffmpeg(self, audio_file: str) -> tuple:
         """
         Read audio file using ffmpeg for formats not supported by soundfile.
