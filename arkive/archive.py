@@ -24,38 +24,9 @@ from functools import partial
 
 from arkive.audio_read import generic_audio_read
 from arkive.definitions import AudioRead
-
-
-# Helper functions for audio processing
-def _get_bit_depth_from_subtype(subtype: str) -> int:
-    """
-    Get bit depth from soundfile subtype string.
-    
-    Args:
-        subtype: Subtype string from soundfile (e.g., 'PCM_16', 'PCM_24', 'FLOAT', 'DOUBLE')
-        
-    Returns:
-        Bit depth as integer
-    """
-    subtype_upper = subtype.upper()
-    
-    # PCM formats
-    if 'PCM_16' in subtype_upper or 'PCM16' in subtype_upper:
-        return 16
-    elif 'PCM_24' in subtype_upper or 'PCM24' in subtype_upper:
-        return 24
-    elif 'PCM_32' in subtype_upper or 'PCM32' in subtype_upper:
-        return 32
-    elif 'PCM_8' in subtype_upper or 'PCM8' in subtype_upper:
-        return 8
-    # Float formats
-    elif 'FLOAT' in subtype_upper and 'DOUBLE' not in subtype_upper:
-        return 32  # Single precision float
-    elif 'DOUBLE' in subtype_upper:
-        return 64  # Double precision float
-    # Default
-    else:
-        return 16  # Default to 16-bit if unknown
+from arkive.utils import (
+    _get_bit_depth_from_subtype,
+)
 
 
 def _convert_audio_data(
