@@ -64,14 +64,66 @@ def _convert_audio_data(
         raise ValueError(f"Unsupported target_bit_depth: {target_bit_depth}")
     
     # Convert to target format
-    out_buf = io.BytesIO()
-    out_buf.name = f'temp.{target_format}'
-    sf.write(out_buf, audio_data, sample_rate, 
-            subtype=subtype, format=target_format.upper())
-    out_buf.seek(0)
-    file_data = out_buf.read()
+    if target_format in ['flac', 'wav']:
+        out_buf = io.BytesIO()
+        out_buf.name = f'temp.{target_format}'
+        sf.write(out_buf, audio_data, sample_rate, 
+                subtype=subtype, format=target_format.upper())
+        out_buf.seek(0)
+        file_data = out_buf.read()
+    elif target_format in ['mp3', 'opus']:
+        raise NotImplementedError("Not yet supported")
     
     return file_data, len(audio_data)
+
+
+def _read_with_ffmpeg_static(audio_file: str) -> Tuple[np.ndarray, int]:
+    """
+    Read audio file using ffmpeg for formats not supported by soundfile (MP3, OPUS, etc.).
+    This function must be at module level to be picklable for multiprocessing.
+    
+    Args:
+        audio_file: Path to input audio file
+        
+    Returns:
+        Tuple of (audio_data, sample_rate)
+    """
+    # Get audio info first
+    probe_cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'stream=sample_rate,channels',
+        '-of', 'default=noprint_wrappers=1',
+        audio_file
+    ]
+    
+    try:
+        probe_output = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode()
+        sample_rate = int([line.split('=')[1] for line in probe_output.split('\n') if 'sample_rate' in line][0])
+    except:
+        sample_rate = 44100  # Default fallback
+    
+    # Convert to WAV PCM using ffmpeg
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+    
+    try:
+        cmd = [
+            'ffmpeg', '-i', audio_file,
+            '-acodec', 'pcm_s16le',
+            '-ar', str(sample_rate),
+            '-y', tmp_path,
+            '-loglevel', 'error'
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Read the converted WAV file
+        audio_data, actual_sr = sf.read(tmp_path, dtype='float32')
+        sample_rate = actual_sr
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    
+    return audio_data, sample_rate
 
 
 # Static function for multiprocessing (must be at module level for pickle)
@@ -106,21 +158,29 @@ def _process_single_audio_file_static(
             with open(audio_file, 'rb') as f:
                 orig_file_data = f.read()
             
+            orig_format = Path(audio_file).suffix.lower().lstrip('.')
+            
             try:
                 audio_data, sample_rate = sf.read(audio_file, dtype='float32')
                 info = sf.info(audio_file)
                 orig_bit_depth = _get_bit_depth_from_subtype(info.subtype)
             except:
-                # Fallback - just return None, will be handled by error
-                print(f"Warning: Could not read {audio_file} with soundfile, skipping...")
-                return None
+                # Fallback to ffmpeg for formats not supported by soundfile (MP3, OPUS, etc.)
+                if orig_format in ['mp3', 'opus', 'm4a', 'aac']:
+                    try:
+                        audio_data, sample_rate = _read_with_ffmpeg_static(audio_file)
+                        orig_bit_depth = 16  # MP3/OPUS converted to 16-bit PCM
+                    except Exception as e:
+                        print(f"Warning: Could not read {audio_file} with soundfile or ffmpeg, skipping... ({e})")
+                        return None
+                else:
+                    print(f"Warning: Could not read {audio_file} with soundfile, skipping...")
+                    return None
             
             if audio_data.ndim == 1:
                 channels = 1
             else:
                 channels = audio_data.shape[1]
-            
-            orig_format = Path(audio_file).suffix.lower().lstrip('.')
         
         orig_samples = len(audio_data)
         
