@@ -284,7 +284,7 @@ class Arkive:
     MAGIC_NUMBER = b'AUDARCH1'
     MAX_BIN_SIZE = 32 * 1024 * 1024 * 1024  # default 32 GB in bytes
     
-    def __init__(self, archive_dir: str):
+    def __init__(self, archive_dir: str, dataset_name: Optional[str] = None):
         """
         Initialize audio archive.
 
@@ -302,6 +302,18 @@ class Arkive:
         self.data = None
         if self.metadata_file.exists():
             self.data = self.get_metadata()
+        
+        if dataset_name is not None:
+            self.dataset_name = dataset_name
+        else:
+            archive_dir = str(archive_dir)
+            archive_dir_parts = archive_dir.split("/")
+            if "split_0" in archive_dir_parts:
+                self.dataset_name = archive_dir_parts[-3]
+            elif archive_dir_parts[-1] == "arkive":
+                self.dataset_name = archive_dir_parts[-2]
+            else:
+                self.dataset_name = None
 
     def __len__(self):
         if self.data is None:
@@ -346,7 +358,8 @@ class Arkive:
         current_bin_index: int,
         current_offset: int,
         item_type: str,
-        show_progress: bool
+        show_progress: bool,
+        utt_id: str
     ) -> Tuple[BinaryIO, int, int, dict]:
         """
         Write a processed result to bin file and create metadata record.
@@ -387,6 +400,7 @@ class Arkive:
         # Create metadata record
         current_bin_path = self._get_bin_file_path(current_bin_index)
         metadata_record = {
+            'utt_id': utt_id,
             'original_file_path': original_file_path,
             'bin_index': current_bin_index,
             'path': str(current_bin_path),
@@ -457,9 +471,10 @@ class Arkive:
             if use_batch_processing:
                 # Batch processing mode (mainly for bytes type)
                 batch = []
+                batch_count = 0
                 items_with_progress = tqdm(items_iterator, desc="Processing audios") if show_progress else items_iterator
                 
-                for item in items_with_progress:
+                for i, item in enumerate(items_with_progress):
                     batch.append(item)
                     
                     # When batch is full, process it
@@ -477,8 +492,11 @@ class Arkive:
                                 num_workers,
                                 show_progress,
                                 flush_interval,
-                                item_type
+                                item_type,
+                                batch_count,
+                                batch_size
                             )
+                        batch_count += 1
                         batch = []  # Clear batch to free memory
                 
                 # Process remaining batch
@@ -496,7 +514,9 @@ class Arkive:
                             num_workers,
                             show_progress,
                             flush_interval,
-                            item_type
+                            item_type,
+                            batch_count,
+                            batch_size
                         )
             else:
                 # Non-batch processing mode (for file paths or when batch_size is None)
@@ -531,10 +551,11 @@ class Arkive:
                             continue
                         
                         # Write result to bin file and get metadata
+                        utt_id = f"{self.dataset_name}_bin{current_bin_index}_{i}"
                         current_bin_file, current_bin_index, current_offset, metadata_record = \
                             self._write_result_to_bin(
                                 result, current_bin_file, current_bin_index, current_offset,
-                                item_type, show_progress
+                                item_type, show_progress, utt_id
                             )
                         metadata_records.append(metadata_record)
                         processed_count += 1
@@ -556,10 +577,11 @@ class Arkive:
                                 continue
                             
                             # Write result to bin file and get metadata
+                            utt_id = f"{self.dataset_name}_bin{current_bin_index}_{i}"
                             current_bin_file, current_bin_index, current_offset, metadata_record = \
                                 self._write_result_to_bin(
                                     result, current_bin_file, current_bin_index, current_offset,
-                                    item_type, show_progress
+                                    item_type, show_progress, utt_id
                                 )
                             metadata_records.append(metadata_record)
                             processed_count += 1
@@ -631,7 +653,9 @@ class Arkive:
         num_workers: int,
         show_progress: bool,
         flush_interval: int,
-        item_type: str
+        item_type: str,
+        batch_count: int,
+        batch_size: int
     ):
         """Process a batch of items with parallel processing."""
         
@@ -646,15 +670,17 @@ class Arkive:
         # Process batch in parallel (use imap_unordered to avoid bubble)
         results_iter = pool.imap_unordered(process_func, batch)
         
-        for result in results_iter:
+        for i, result in enumerate(results_iter):
             if result is None:
                 continue
             
             # Write result to bin file and get metadata
+            global_index = batch_count * batch_size + i
+            utt_id = f"{self.dataset_name}_bin{current_bin_index}_{global_index}"
             current_bin_file, current_bin_index, current_offset, metadata_record = \
                 self._write_result_to_bin(
                     result, current_bin_file, current_bin_index, current_offset,
-                    item_type, show_progress
+                    item_type, show_progress, utt_id
                 )
             metadata_records.append(metadata_record)
             processed_count += 1
@@ -1093,9 +1119,10 @@ class Arkive:
             filename = Path(row['original_file_path']).name
             size_mb = row['file_size_bytes'] / (1024**2)
             bin_idx = row['bin_index']
+            utt_id = row['utt_id']
             # Calculate duration from samples and sample_rate
             duration_seconds = row['length'] / row['sample_rate'] if row['sample_rate'] > 0 else 0
-            print(f"{idx:4d} | Bin{bin_idx} | {filename:40s} | {row['sample_rate']:6d}Hz | "
+            print(f"{idx:4d} | {utt_id:40s} | Bin{bin_idx} | {filename:40s} | {row['sample_rate']:6d}Hz | "
                     f"{row['channels']:1d}ch | {duration_seconds:7.2f}s | {size_mb:7.2f}MB")
 
     def clear(self, confirm: bool = False):
