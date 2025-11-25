@@ -62,7 +62,7 @@ def wav_audio_read(archive_path: str, start_offset: int, file_size: int, start_t
             "wav"
         )
 
-def generic_audio_read(audio_bytes: bytes, file_type: str, start_time: int, end_time: int) -> AudioRead:
+def generic_audio_read(audio_bytes: bytes, file_type: str, start_time: int = None, end_time: int = None) -> AudioRead:
     audio_file_like = io.BytesIO(audio_bytes)
 
     audio, sr = sf.read(audio_file_like)
@@ -73,12 +73,12 @@ def generic_audio_read(audio_bytes: bytes, file_type: str, start_time: int, end_
     if start_time is None:
         start_frame = 0
     else:
-        start_frame = start_time * sr
+        start_frame = int(start_time * sr)
 
     if end_time is None:
         end_frame = audio.shape[0]
     else:
-        end_frame = end_time * sr
+        end_frame = int(end_time * sr)
 
     return AudioRead(
         file_type=file_type,
